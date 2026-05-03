@@ -6,12 +6,9 @@ import { createClient } from '@/lib/supabase/server';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-// 遅延初期化: ビルド時に API キーが未設定でもエラーにならない
 function getGenAI() {
   return new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_API_KEY!);
 }
-
-// ── Excel helpers ──────────────────────────────────────────────────────────────
 
 async function getExcelFields(buf: Uint8Array): Promise<string[]> {
   const wb = new ExcelJS.Workbook();
@@ -21,7 +18,7 @@ async function getExcelFields(buf: Uint8Array): Promise<string[]> {
     sheet.eachRow(row => {
       row.eachCell(cell => {
         const v = String(cell.value ?? '');
-        const m = v.match(/\{\{(\w+)\}\}/g);
+        const m = v.match(/\{\{([\w\-一-龥ぁ-んァ-ヶー]+)\}\}/g);
         if (m) m.forEach(tag => fields.add(tag.replace(/\{\{|\}\}/g, '')));
       });
     });
@@ -49,8 +46,6 @@ async function fillExcel(buf: Uint8Array, data: Record<string, string>): Promise
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
-// ── Word helpers ───────────────────────────────────────────────────────────────
-
 function getWordFields(buf: Uint8Array): string[] {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -59,7 +54,8 @@ function getWordFields(buf: Uint8Array): string[] {
     const xmlFile = zip.files['word/document.xml'];
     if (!xmlFile) return [];
     const xml = xmlFile.asText() as string;
-    const m = xml.match(/\{\{(\w+)\}\}/g);
+    const text = xml.replace(/<[^>]+>/g, '');
+    const m = text.match(/\{\{([\w\-一-龥ぁ-んァ-ヶー]+)\}\}/g);
     return m ? [...new Set<string>(m.map((t: string) => t.replace(/\{\{|\}\}/g, '')))] : [];
   } catch {
     return [];
@@ -81,10 +77,17 @@ function fillWord(buf: Uint8Array, data: Record<string, string>): Uint8Array {
   return doc.getZip().generate({ type: 'nodebuffer', compression: 'DEFLATE' }) as Uint8Array;
 }
 
-// ── Main route ─────────────────────────────────────────────────────────────────
+function normalizeExtracted(input: unknown): Record<string, string> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  return Object.fromEntries(
+    Object.entries(input as Record<string, unknown>).map(([key, value]) => [
+      key,
+      value === null || value === undefined ? '' : String(value),
+    ]),
+  );
+}
 
 export async function POST(req: NextRequest) {
-  // ── 認証チェック ──────────────────────────────────────────────────────────
   const supabase = await createClient();
   const { data: { user }, error: authError } = await supabase.auth.getUser();
 
@@ -95,8 +98,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // ── クレジットチェック ────────────────────────────────────────────────────
-  // RLS: profiles_self allows user to read their own row (auth.uid() = id)
   const { data: profile, error: profileError } = await supabase
     .from('profiles')
     .select('credits, plan')
@@ -104,74 +105,61 @@ export async function POST(req: NextRequest) {
     .single();
 
   if (profileError || !profile) {
+    console.error('[convert] profile fetch failed:', profileError?.message);
     return NextResponse.json({ error: 'プロフィール取得に失敗しました' }, { status: 500 });
   }
 
-  if (profile.credits <= 0) {
+  if (profile.plan !== 'pro' && profile.credits <= 0) {
     return NextResponse.json(
       { error: 'クレジットが不足しています。プランをアップグレードしてください。', credits: 0 },
       { status: 403 }
     );
   }
 
-  // ── ファイル受信 ───────────────────────────────────────────────────────────
   try {
     const form = await req.formData();
     const templateFile = form.get('template') as File | null;
-    const imageFile    = form.get('image')    as File | null;
+    const imageFile = form.get('image') as File | null;
 
     if (!templateFile || !imageFile) {
       return NextResponse.json({ error: 'template と image の両方が必要です' }, { status: 400 });
     }
 
-    const fname   = templateFile.name.toLowerCase();
-    const isExcel = fname.endsWith('.xlsx') || fname.endsWith('.xls');
-    const isWord  = fname.endsWith('.docx');
+    const fname = templateFile.name.toLowerCase();
+    const isExcel = fname.endsWith('.xlsx');
+    const isWord = fname.endsWith('.docx');
 
     if (!isExcel && !isWord) {
       return NextResponse.json(
-        { error: 'テンプレートは .xlsx / .xls / .docx に対応しています' },
+        { error: 'テンプレートは .xlsx / .docx のみ対応しています（.xls は非対応です）' },
         { status: 400 },
       );
     }
 
     const templateBuf = new Uint8Array(await templateFile.arrayBuffer());
-    const imageBuf    = new Uint8Array(await imageFile.arrayBuffer());
-    const imageB64    = Buffer.from(imageBuf).toString('base64');
-    const mimeType    = (imageFile.type || 'image/jpeg') as string;
+    const imageBuf = new Uint8Array(await imageFile.arrayBuffer());
+    const imageB64 = Buffer.from(imageBuf).toString('base64');
+    const mimeType = imageFile.type || 'image/jpeg';
 
-    // フィールド名をテンプレートから抽出
-    const fields = isExcel
-      ? await getExcelFields(templateBuf)
-      : getWordFields(templateBuf);
+    const fields = isExcel ? await getExcelFields(templateBuf) : getWordFields(templateBuf);
 
-    // ── デモモード（NEXT_PUBLIC_DEMO_MODE=true で Gemini API をスキップ）────
     const isDemoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
     let extracted: Record<string, string> = {};
 
     if (isDemoMode) {
       const now = new Date();
       const demoDefaults: Record<string, string> = {
-        name:    '山田 太郎（デモ）',
-        date:    now.toLocaleDateString('ja-JP'),
-        amount:  '12,500',
+        name: '山田 太郎（デモ）',
+        date: now.toLocaleDateString('ja-JP'),
+        amount: '12,500',
         address: '東京都渋谷区1-2-3',
-        note:    'デモデータです',
+        note: 'デモデータです',
         company: '株式会社サンプル',
-        phone:   '03-1234-5678',
-        total:   '12,500',
+        phone: '03-1234-5678',
+        total: '12,500',
       };
-      extracted = Object.fromEntries(
-        fields.map(f => [f, demoDefaults[f] ?? '[' + f + 'のデモ値]'])
-      );
+      extracted = Object.fromEntries(fields.map(f => [f, demoDefaults[f] ?? '[' + f + 'のデモ値]']));
     } else {
-      // ── 指数バックオフ + モデルフォールバック OCR ─────────────────────────
-      const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
-      // 2026年時点で有効なモデル: gemini-2.0-flash → gemini-2.0-flash-lite の順でフォールバック
-      const OCR_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
-      const MAX_RETRIES = 3;
-
-      // API キー存在確認（ログで即座に問題を特定できるように）
       const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) {
         console.error('[OCR] FATAL: GOOGLE_GENERATIVE_AI_API_KEY is not set');
@@ -180,21 +168,20 @@ export async function POST(req: NextRequest) {
           { status: 500 },
         );
       }
-      console.log('[OCR] API key present, length:', apiKey.length);
 
+      const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
+      const OCR_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
+      const MAX_RETRIES = 3;
       const fieldHint = fields.length > 0
-        ? `テンプレートには以下のフィールドがあります: ${fields.join(', ')}。これらに対応する手書き文字を抽出してください。`
-        : '手書き書類から読み取れるすべてのキーと値を抽出してください。';
+        ? `テンプレートには以下のフィールドがあります: ${fields.join(', ')}。必ずこのキー名でJSONを返してください。`
+        : '手書き書類から読み取れるキーと値をJSONで抽出してください。';
 
       const prompt =
         'あなたは手書き書類のOCR専門家です。この画像からテキストを正確に抽出してください。\n\n' +
-        '【ドメイン知識】\n' +
-        '- 手書きの業務書類です。日付、数値、氏名、目的などが含まれる場合があります。\n' +
-        '- 読み取りが困難な箇所は推測せず null を使用してください。\n\n' +
         '【対象フィールド】\n' + fieldHint + '\n\n' +
-        '【出力形式】JSONオブジェクトのみ返してください（マークダウン不要）。\n' +
-        '読み取れない場合は値を null にしてください。\n' +
-        '例: {"name": "田中太郎", "date": "2024/04/23", "amount": "5000", "note": null}';
+        '【厳守】JSONオブジェクトのみ返してください。マークダウン、説明文、コードフェンスは禁止です。\n' +
+        '読み取れない値は null にしてください。\n' +
+        '例: {"name":"田中太郎","date":"2024/04/23","amount":"5000","note":null}';
 
       let parseSuccess = false;
       let lastErrorMsg = '';
@@ -212,16 +199,13 @@ export async function POST(req: NextRequest) {
             const rawText = result.response.text().replace(/```json|```/g, '').trim();
             console.log('[OCR] Raw response (first 200):', rawText.substring(0, 200));
             const jsonStr = rawText.match(/\{[\s\S]*\}/)?.[0] ?? rawText;
-            const parsed = JSON.parse(jsonStr);
-            extracted = parsed.data ?? parsed;
-            for (const key of Object.keys(extracted)) {
-              if (extracted[key] === null) extracted[key] = '';
-            }
+            const parsed = JSON.parse(jsonStr) as unknown;
+            extracted = normalizeExtracted((parsed as { data?: unknown }).data ?? parsed);
             parseSuccess = true;
             console.log('[OCR] Success with model:', modelName);
             break;
           } catch (error: unknown) {
-            const err = error as { status?: number; message?: string; toString?: () => string };
+            const err = error as { status?: number; message?: string };
             lastErrorMsg = err?.message ?? String(error);
             console.error(`[OCR] ${modelName} attempt ${retryCount + 1} failed:`, lastErrorMsg);
             const isRateLimit = err?.status === 429 || lastErrorMsg.includes('429') || lastErrorMsg.includes('RESOURCE_EXHAUSTED');
@@ -241,54 +225,40 @@ export async function POST(req: NextRequest) {
       if (!parseSuccess) {
         console.error('[OCR] All models failed. Last error:', lastErrorMsg);
         return NextResponse.json(
-          { error: `OCR処理に失敗しました。[詳細: ${lastErrorMsg.substring(0, 200)}]` },
+          { error: `OCR処理に失敗しました。時間を置いて再実行してください。[詳細: ${lastErrorMsg.substring(0, 200)}]` },
           { status: 500 },
         );
       }
     }
 
-    // ── クレジット消費 + 変換ログ ──────────────────────────────────────────
-    // decrement_credits is SECURITY DEFINER — works with user session
-    await supabase.rpc('decrement_credits', { user_id: user.id });
-    // RLS: conversions_self allows user to insert their own row
-    await supabase.from('conversions').insert({
+    let filled: Uint8Array;
+    let contentType: string;
+    if (isExcel) {
+      filled = await fillExcel(templateBuf, extracted);
+      contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    } else {
+      filled = fillWord(templateBuf, extracted);
+      contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    }
+
+    const { error: creditError } = await supabase.rpc('decrement_credits', { user_id: user.id });
+    if (creditError) console.error('[convert] decrement_credits failed:', creditError.message);
+
+    const { error: conversionError } = await supabase.from('conversions').insert({
       user_id: user.id,
       template_name: templateFile.name,
       file_type: isExcel ? 'xlsx' : 'docx',
       credits_used: 1,
       status: 'success',
     });
+    if (conversionError) console.error('[convert] conversions insert failed:', conversionError.message);
 
-    // ── ファイル生成 ───────────────────────────────────────────────────────
-    if (isExcel) {
-      const filled = await fillExcel(templateBuf, extracted);
-      return new NextResponse(filled as unknown as BodyInit, {
-        headers: {
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'Content-Disposition': 'attachment; filename="filled_' + encodeURIComponent(templateFile.name) + '"',
-        },
-      });
-    } else {
-      let filled: Uint8Array;
-      try {
-        filled = fillWord(templateBuf, extracted);
-      } catch (e) {
-        const err = e as { code?: string; message?: string };
-        if (err.code === 'MODULE_NOT_FOUND') {
-          return NextResponse.json(
-            { error: 'Word処理ライブラリ未インストール。install_word.bat を実行してください。' },
-            { status: 500 },
-          );
-        }
-        throw e;
-      }
-      return new NextResponse(filled as unknown as BodyInit, {
-        headers: {
-          'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          'Content-Disposition': 'attachment; filename="filled_' + encodeURIComponent(templateFile.name) + '"',
-        },
-      });
-    }
+    return new NextResponse(filled as unknown as BodyInit, {
+      headers: {
+        'Content-Type': contentType,
+        'Content-Disposition': 'attachment; filename="filled_' + encodeURIComponent(templateFile.name) + '"',
+      },
+    });
   } catch (err) {
     console.error('[/api/convert]', err);
     return NextResponse.json(
