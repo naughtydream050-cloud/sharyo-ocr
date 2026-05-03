@@ -6,12 +6,66 @@ import { createClient } from '@/lib/supabase/server';
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-// 遅延初期化: ビルド時に API キーが未設定でもエラーにならない
 function getGenAI() {
   return new GoogleGenerativeAI(process.env.GOOGLE_GENERATIVE_AI_API_KEY!);
 }
 
-// ── Excel helpers ──────────────────────────────────────────────────────────────
+type MonthlyReportRow = {
+  date?: string | number | null;
+  user?: string | null;
+  departure_meter?: string | number | null;
+  arrival_meter?: string | number | null;
+  note?: string | null;
+  departure_time?: string | null;
+  arrival_time?: string | null;
+  child_check?: string | boolean | null;
+};
+
+type MonthlyReportPayload = {
+  rows?: MonthlyReportRow[];
+};
+
+function isMonthlyReportWorkbook(wb: ExcelJS.Workbook): boolean {
+  return Boolean(wb.getWorksheet('ノア'));
+}
+
+function cellText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  return String(value);
+}
+
+function parseMonthlyReportPayload(input: unknown): MonthlyReportRow[] {
+  const source = input && typeof input === 'object' && !Array.isArray(input)
+    ? (input as MonthlyReportPayload).rows
+    : undefined;
+  if (!Array.isArray(source)) return [];
+  return source
+    .filter(row => row && typeof row === 'object')
+    .slice(0, 80);
+}
+
+async function fillNoahMonthlyReport(buf: Uint8Array, rows: MonthlyReportRow[]): Promise<Uint8Array> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+  const sheet = wb.getWorksheet('ノア');
+  if (!sheet) throw new Error('車両月報テンプレートに「ノア」シートが見つかりません');
+
+  rows.forEach((row, index) => {
+    const excelRow = 6 + index;
+    sheet.getCell(`B${excelRow}`).value = cellText(row.date);
+    sheet.getCell(`C${excelRow}`).value = cellText(row.user);
+    sheet.getCell(`F${excelRow}`).value = cellText(row.departure_meter);
+    sheet.getCell(`I${excelRow}`).value = cellText(row.arrival_meter);
+    sheet.getCell(`O${excelRow}`).value = cellText(row.note);
+    sheet.getCell(`P${excelRow}`).value = cellText(row.departure_time);
+    sheet.getCell(`Q${excelRow}`).value = cellText(row.arrival_time);
+    sheet.getCell(`R${excelRow}`).value = typeof row.child_check === 'boolean'
+      ? (row.child_check ? '☑' : '')
+      : cellText(row.child_check);
+  });
+
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
 
 async function getExcelFields(buf: Uint8Array): Promise<string[]> {
   const wb = new ExcelJS.Workbook();
@@ -49,8 +103,6 @@ async function fillExcel(buf: Uint8Array, data: Record<string, string>): Promise
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
-// ── Word helpers ───────────────────────────────────────────────────────────────
-
 function getWordFields(buf: Uint8Array): string[] {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -81,10 +133,13 @@ function fillWord(buf: Uint8Array, data: Record<string, string>): Uint8Array {
   return doc.getZip().generate({ type: 'nodebuffer', compression: 'DEFLATE' }) as Uint8Array;
 }
 
-// ── Main route ─────────────────────────────────────────────────────────────────
+async function detectMonthlyReport(buf: Uint8Array): Promise<boolean> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf as any); // eslint-disable-line @typescript-eslint/no-explicit-any
+  return isMonthlyReportWorkbook(wb);
+}
 
 export async function POST(req: NextRequest) {
-  // ── 認証チェック ──────────────────────────────────────────────────────────
   const supabase = await createClient();
   const { data: { user }, error: authError } = await supabase.auth.getUser();
 
@@ -95,8 +150,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // ── クレジットチェック ────────────────────────────────────────────────────
-  // RLS: profiles_self allows user to read their own row (auth.uid() = id)
   const { data: profile, error: profileError } = await supabase
     .from('profiles')
     .select('credits, plan')
@@ -114,7 +167,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // ── ファイル受信 ───────────────────────────────────────────────────────────
   try {
     const form = await req.formData();
     const templateFile = form.get('template') as File | null;
@@ -125,12 +177,12 @@ export async function POST(req: NextRequest) {
     }
 
     const fname   = templateFile.name.toLowerCase();
-    const isExcel = fname.endsWith('.xlsx') || fname.endsWith('.xls');
+    const isExcel = fname.endsWith('.xlsx');
     const isWord  = fname.endsWith('.docx');
 
     if (!isExcel && !isWord) {
       return NextResponse.json(
-        { error: 'テンプレートは .xlsx / .xls / .docx に対応しています' },
+        { error: 'テンプレートは .xlsx / .docx に対応しています（.xls / .ods は非対応です）' },
         { status: 400 },
       );
     }
@@ -139,39 +191,39 @@ export async function POST(req: NextRequest) {
     const imageBuf    = new Uint8Array(await imageFile.arrayBuffer());
     const imageB64    = Buffer.from(imageBuf).toString('base64');
     const mimeType    = (imageFile.type || 'image/jpeg') as string;
+    const isMonthlyReport = isExcel ? await detectMonthlyReport(templateBuf) : false;
 
-    // フィールド名をテンプレートから抽出
-    const fields = isExcel
-      ? await getExcelFields(templateBuf)
-      : getWordFields(templateBuf);
+    const fields = isMonthlyReport
+      ? []
+      : isExcel
+        ? await getExcelFields(templateBuf)
+        : getWordFields(templateBuf);
 
-    // ── デモモード（NEXT_PUBLIC_DEMO_MODE=true で Gemini API をスキップ）────
     const isDemoMode = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
-    let extracted: Record<string, string> = {};
+    let extracted: Record<string, unknown> = {};
 
     if (isDemoMode) {
-      const now = new Date();
-      const demoDefaults: Record<string, string> = {
-        name:    '山田 太郎（デモ）',
-        date:    now.toLocaleDateString('ja-JP'),
-        amount:  '12,500',
-        address: '東京都渋谷区1-2-3',
-        note:    'デモデータです',
-        company: '株式会社サンプル',
-        phone:   '03-1234-5678',
-        total:   '12,500',
-      };
-      extracted = Object.fromEntries(
-        fields.map(f => [f, demoDefaults[f] ?? '[' + f + 'のデモ値]'])
-      );
+      if (isMonthlyReport) {
+        extracted = { rows: [{ date: '1', user: '山田', departure_meter: '173816', arrival_meter: '173826', note: '送迎', departure_time: '8:10', arrival_time: '9:54', child_check: true }] };
+      } else {
+        const now = new Date();
+        const demoDefaults: Record<string, string> = {
+          name:    '山田 太郎（デモ）',
+          date:    now.toLocaleDateString('ja-JP'),
+          amount:  '12,500',
+          address: '東京都渋谷区1-2-3',
+          note:    'デモデータです',
+          company: '株式会社サンプル',
+          phone:   '03-1234-5678',
+          total:   '12,500',
+        };
+        extracted = Object.fromEntries(fields.map(f => [f, demoDefaults[f] ?? '[' + f + 'のデモ値]']));
+      }
     } else {
-      // ── 指数バックオフ + モデルフォールバック OCR ─────────────────────────
       const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
-      // 2026年時点で有効なモデル: gemini-2.0-flash → gemini-2.0-flash-lite の順でフォールバック
       const OCR_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
       const MAX_RETRIES = 3;
 
-      // API キー存在確認（ログで即座に問題を特定できるように）
       const apiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) {
         console.error('[OCR] FATAL: GOOGLE_GENERATIVE_AI_API_KEY is not set');
@@ -182,19 +234,19 @@ export async function POST(req: NextRequest) {
       }
       console.log('[OCR] API key present, length:', apiKey.length);
 
-      const fieldHint = fields.length > 0
-        ? `テンプレートには以下のフィールドがあります: ${fields.join(', ')}。これらに対応する手書き文字を抽出してください。`
-        : '手書き書類から読み取れるすべてのキーと値を抽出してください。';
-
-      const prompt =
-        'あなたは手書き書類のOCR専門家です。この画像からテキストを正確に抽出してください。\n\n' +
-        '【ドメイン知識】\n' +
-        '- 手書きの業務書類です。日付、数値、氏名、目的などが含まれる場合があります。\n' +
-        '- 読み取りが困難な箇所は推測せず null を使用してください。\n\n' +
-        '【対象フィールド】\n' + fieldHint + '\n\n' +
-        '【出力形式】JSONオブジェクトのみ返してください（マークダウン不要）。\n' +
-        '読み取れない場合は値を null にしてください。\n' +
-        '例: {"name": "田中太郎", "date": "2024/04/23", "amount": "5000", "note": null}';
+      const prompt = isMonthlyReport
+        ? 'あなたは車両月報のOCR専門家です。この画像の表を上から下へ読み取り、JSONオブジェクトのみ返してください。説明文やマークダウンは禁止です。形式は必ず {"rows":[{"date":"1","user":"使用者","departure_meter":"173816","arrival_meter":"173826","note":"送迎","departure_time":"8:10","arrival_time":"9:54","child_check":true}]} です。キーは date, user, departure_meter, arrival_meter, note, departure_time, arrival_time, child_check のみ使用してください。読み取れない値は空文字、残留児確認にチェックがある場合は child_check を true、ない場合は false にしてください。'
+        : 'あなたは手書き書類のOCR専門家です。この画像からテキストを正確に抽出してください。\n\n' +
+          '【ドメイン知識】\n' +
+          '- 手書きの業務書類です。日付、数値、氏名、目的などが含まれる場合があります。\n' +
+          '- 読み取りが困難な箇所は推測せず null を使用してください。\n\n' +
+          '【対象フィールド】\n' +
+          (fields.length > 0
+            ? `テンプレートには以下のフィールドがあります: ${fields.join(', ')}。これらに対応する手書き文字を抽出してください。`
+            : '手書き書類から読み取れるすべてのキーと値を抽出してください。') +
+          '\n\n【出力形式】JSONオブジェクトのみ返してください（マークダウン不要）。\n' +
+          '読み取れない場合は値を null にしてください。\n' +
+          '例: {"name": "田中太郎", "date": "2024/04/23", "amount": "5000", "note": null}';
 
       let parseSuccess = false;
       let lastErrorMsg = '';
@@ -214,8 +266,10 @@ export async function POST(req: NextRequest) {
             const jsonStr = rawText.match(/\{[\s\S]*\}/)?.[0] ?? rawText;
             const parsed = JSON.parse(jsonStr);
             extracted = parsed.data ?? parsed;
-            for (const key of Object.keys(extracted)) {
-              if (extracted[key] === null) extracted[key] = '';
+            if (!isMonthlyReport) {
+              for (const key of Object.keys(extracted)) {
+                if (extracted[key] === null) extracted[key] = '';
+              }
             }
             parseSuccess = true;
             console.log('[OCR] Success with model:', modelName);
@@ -247,10 +301,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── クレジット消費 + 変換ログ ──────────────────────────────────────────
-    // decrement_credits is SECURITY DEFINER — works with user session
     await supabase.rpc('decrement_credits', { user_id: user.id });
-    // RLS: conversions_self allows user to insert their own row
     await supabase.from('conversions').insert({
       user_id: user.id,
       template_name: templateFile.name,
@@ -259,9 +310,10 @@ export async function POST(req: NextRequest) {
       status: 'success',
     });
 
-    // ── ファイル生成 ───────────────────────────────────────────────────────
     if (isExcel) {
-      const filled = await fillExcel(templateBuf, extracted);
+      const filled = isMonthlyReport
+        ? await fillNoahMonthlyReport(templateBuf, parseMonthlyReportPayload(extracted))
+        : await fillExcel(templateBuf, extracted as Record<string, string>);
       return new NextResponse(filled as unknown as BodyInit, {
         headers: {
           'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -271,7 +323,7 @@ export async function POST(req: NextRequest) {
     } else {
       let filled: Uint8Array;
       try {
-        filled = fillWord(templateBuf, extracted);
+        filled = fillWord(templateBuf, extracted as Record<string, string>);
       } catch (e) {
         const err = e as { code?: string; message?: string };
         if (err.code === 'MODULE_NOT_FOUND') {
